@@ -4,3 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dotenv = "0.15.0"
+openai_api_rust = "0.1.9"
+petgraph = "0.7.1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql"] }
+tokio = { version = "1.43.0", features = ["rt", "macros", "rt-multi-thread"] }
