@@ -12,6 +12,7 @@ use petgraph::graph::{NodeIndex, UnGraph};
 use petgraph::{Graph, Undirected};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
+#[allow(dead_code)]
 #[derive(sqlx::FromRow, Debug)]
 struct ConnectionRow {
     id: u32,
@@ -20,6 +21,7 @@ struct ConnectionRow {
     distance: f64,
 }
 
+#[allow(dead_code)]
 #[derive(sqlx::FromRow, Debug)]
 struct StationRow {
     station_cd: u32,
@@ -217,8 +219,8 @@ impl RouteFinder {
     async fn find_edge_nodes(&self) -> sqlx::Result<Vec<StationRow>> {
         let mut conn = self.pool.acquire().await?;
 
-        let from_coords = self.coordinates_pairs.get(0).unwrap().clone();
-        let destination_coords = self.coordinates_pairs.get(1).unwrap().clone();
+        let from_coords = *self.coordinates_pairs.first().unwrap();
+        let destination_coords = *self.coordinates_pairs.last().unwrap();
 
         let rows = sqlx::query_as!(
             StationRow,
@@ -343,8 +345,7 @@ impl RouteFinder {
         let from_sta = edge_nodes.first().unwrap();
         let destination_sta = edge_nodes.last().unwrap();
 
-        println!("");
-        println!("AIが指定した始発駅: {}", from_sta.station_name);
+        println!("\nAIが指定した始発駅: {}", from_sta.station_name);
         println!("AIが指定した終着駅: {}", destination_sta.station_name);
         println!("探索を開始しました...\n");
 
@@ -406,11 +407,21 @@ async fn main() {
     let finder = RouteFinder::new(pool, coordinates_pairs).await;
 
     let stations = finder.find_routes().await.expect("経路検索に失敗しました");
-    for station in stations {
-        println!(
+
+    let mut texts = String::new();
+
+    for (index, station) in stations.iter().enumerate() {
+        let stations_len = stations.len();
+        texts += &format!(
             "{}({})",
             station.station_name,
-            station.line_name.unwrap_or("???".to_string())
+            station.line_name.clone().unwrap()
         );
+
+        if stations_len - 1 > index {
+            texts += " -> ";
+        }
     }
+
+    println!("{}", texts);
 }
