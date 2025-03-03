@@ -1,16 +1,12 @@
-use petgraph::visit::EdgeRef;
-use std::collections::BinaryHeap;
-use std::str::FromStr;
-use std::{collections::HashMap, io};
-
 use dotenv::dotenv;
-use openai_api_rust::{
-    Auth, Message, OpenAI, Role,
-    chat::{ChatApi, ChatBody},
-};
 use petgraph::graph::{NodeIndex, UnGraph};
+use petgraph::visit::EdgeRef;
 use petgraph::{Graph, Undirected};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
+use std::collections::BinaryHeap;
+use std::{collections::HashMap, io};
 
 #[allow(dead_code)]
 #[derive(sqlx::FromRow, Debug)]
@@ -47,6 +43,21 @@ struct StationRow {
     e_sort: u32,
     distance: Option<f64>,
     line_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Content {
+    content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Choice {
+    delta: Content,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResponseData {
+    choices: Vec<Choice>,
 }
 
 fn dijkstra_with_path(
@@ -136,74 +147,42 @@ fn reconstruct_path(
     None
 }
 
-fn predict(from_place_name: String, destination_place_name: String) -> io::Result<Vec<(f64, f64)>> {
-    let auth = Auth::new("lm-studio");
-    let openai = OpenAI::new(auth, "http://localhost:1234/v1/");
+async fn predict(
+    from_place_name: String,
+    destination_place_name: String,
+    stop_stations: Vec<String>,
+) -> Result<(), reqwest::Error> {
+    let client = reqwest::Client::new();
+    let mut res= client
+        .post("http://localhost:1234/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .body(json!({
+            "model": "gemma-2-9b-it",
+            "messages": [{
+                "role": "user",
+                "content": format!("{}から{}まで鉄道で移動するのでおすすめの観光地を教えてください。ただし、下記の駅の付近限定でお願いします。\n{:?}", from_place_name,destination_place_name, stop_stations)
+            }],
+            "stream": true
+        }).to_string())
+        .send().await.unwrap().bytes_stream();
 
-    let body = ChatBody {
-        model: "gemma-2-9b-it".to_string(),
-        max_tokens: None,
-        temperature: None,
-        top_p: None,
-        n: None,
-        stream: None,
-        stop: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-        logit_bias: None,
-        user: None,
-        messages: vec![Message {
-            role: Role::User,
-            content: format!("{} {}", from_place_name, destination_place_name).to_string(),
-        }],
-    };
-
-    let rs = openai.chat_completion_create(&body);
-    let choice = rs.unwrap().choices;
-    let message = &choice[0].message.as_ref().unwrap();
-
-    if message.content.contains("ERR") {
-        panic!("AIが地名を見つけられませんでした");
+    while let Some(Ok(item)) = tokio_stream::StreamExt::next(&mut res).await {
+        let s = String::from_utf8_lossy(&item).trim().replace("data: ", "");
+        if let Ok(data) = serde_json::from_str::<ResponseData>(&s) {
+            termimad::print_inline(&data.choices[0].delta.content);
+        }
     }
 
-    let coordinates = message
-        .content
-        .split("\n")
-        .collect::<Vec<&str>>()
-        .iter()
-        .map(|x| x.trim().to_string())
-        .filter(|x| !x.is_empty())
-        .collect::<Vec<String>>();
-
-    if coordinates.len() < 2 {
-        panic!("AIが正しく回答しませんでした");
-    }
-
-    Ok(coordinates
-        .iter()
-        .map(|x| {
-            let lat_lon = x
-                .split(" ")
-                .collect::<Vec<&str>>()
-                .iter()
-                .map(|x| f64::from_str(x).unwrap())
-                .collect::<Vec<f64>>();
-            (lat_lon[0], lat_lon[1])
-        })
-        .collect())
+    Ok(())
 }
 
 struct RouteFinder {
     pool: Pool<MySql>,
-    coordinates_pairs: Vec<(f64, f64)>,
 }
 
 impl RouteFinder {
-    async fn new(pool: Pool<MySql>, coordinates_pairs: Vec<(f64, f64)>) -> Self {
-        RouteFinder {
-            pool,
-            coordinates_pairs,
-        }
+    async fn new(pool: Pool<MySql>) -> Self {
+        RouteFinder { pool }
     }
 
     async fn get_all_nodes(&self) -> sqlx::Result<Vec<ConnectionRow>> {
@@ -216,78 +195,51 @@ impl RouteFinder {
         Ok(rows)
     }
 
-    async fn find_edge_nodes(&self) -> sqlx::Result<Vec<StationRow>> {
-        let mut conn = self.pool.acquire().await?;
+    async fn find_station_by_name(&self, station_name: String) -> sqlx::Result<StationRow> {
+        let mut conn: sqlx::pool::PoolConnection<MySql> = self.pool.acquire().await?;
 
-        let from_coords = *self.coordinates_pairs.first().unwrap();
-        let destination_coords = *self.coordinates_pairs.last().unwrap();
-
-        let rows = sqlx::query_as!(
+        let station_row: StationRow = sqlx::query_as!(
             StationRow,
-            "(SELECT
-                s.*,
-                l.line_name, 
-                (
-                  6371 * acos(
-                    cos(
-                      radians(s.lat)
-                    ) * cos(
-                      radians(?)
-                    ) * cos(
-                      radians(?) - radians(s.lon)
-                    ) + sin(
-                      radians(s.lat)
-                    ) * sin(
-                      radians(?)
-                    )
-                  )
-                ) AS distance
-              FROM `stations` AS s
-              JOIN `lines` AS l ON l.line_cd = s.line_cd AND l.e_status = 0
-              WHERE
-                s.station_cd = s.station_g_cd
+            "SELECT s.*,
+            l.line_name,
+            CAST(0.0 AS DOUBLE) AS distance
+            FROM `stations` AS s
+            JOIN `lines` as l ON l.line_cd = s.line_cd
+            WHERE (
+                    s.station_name = ?
+                    OR s.station_name_r = ?
+                    OR s.station_name_k = ?
+                    OR s.station_name_zh = ?
+                    OR s.station_name_ko = ?
+                )
                 AND s.e_status = 0
-              ORDER BY 
-                distance
-              LIMIT 1)
-              UNION
-              (SELECT
-                s.*,
-                l.line_name, 
-                (
-                  6371 * acos(
-                    cos(
-                      radians(s.lat)
-                    ) * cos(
-                      radians(?)
-                    ) * cos(
-                      radians(?) - radians(s.lon)
-                    ) + sin(
-                      radians(s.lat)
-                    ) * sin(
-                      radians(?)
-                    )
-                  )
-                ) AS distance
-              FROM `stations` AS s
-              JOIN `lines` AS l ON l.line_cd = s.line_cd AND l.e_status = 0
-              WHERE
-                s.station_cd = s.station_g_cd
-                AND s.e_status = 0
-              ORDER BY 
-                distance
-              LIMIT 1)",
-            from_coords.0,
-            from_coords.1,
-            from_coords.0,
-            destination_coords.0,
-            destination_coords.1,
-            destination_coords.0
+            LIMIT 1",
+            &station_name,
+            &station_name,
+            &station_name,
+            &station_name,
+            &station_name,
         )
-        .fetch_all(&mut *conn)
-        .await?;
+        .fetch_optional(&mut *conn)
+        .await
+        .expect("データベースでエラーが発生しました")
+        .expect(&format!("や、{}駅のNASA🚀", station_name));
 
-        Ok(rows)
+        Ok(station_row)
+    }
+
+    async fn find_edge_nodes(
+        &self,
+        from_place_name: String,
+        destination_place_name: String,
+    ) -> sqlx::Result<Vec<StationRow>> {
+        let from_station_row = self.find_station_by_name(from_place_name).await.unwrap();
+        let destination_station_row = self
+            .find_station_by_name(destination_place_name)
+            .await
+            .unwrap();
+
+        Ok(vec![from_station_row, destination_station_row])
     }
 
     async fn get_nodes_by_ids(&self, ids: &[u32]) -> sqlx::Result<Vec<StationRow>> {
@@ -327,11 +279,18 @@ impl RouteFinder {
         Ok(rows)
     }
 
-    async fn find_routes(&self) -> sqlx::Result<Vec<StationRow>> {
+    async fn find_routes(
+        &self,
+        from_place_name: String,
+        destination_place_name: String,
+    ) -> sqlx::Result<Vec<StationRow>> {
         let conn_nodes = self.get_all_nodes().await?;
 
         let edge_nodes = self
-            .find_edge_nodes()
+            .find_edge_nodes(
+                from_place_name.trim().to_string(),
+                destination_place_name.trim().to_string(),
+            )
             .await
             .expect("始発もしくは終着駅検索に失敗しました");
 
@@ -345,9 +304,8 @@ impl RouteFinder {
         let from_sta = edge_nodes.first().unwrap();
         let destination_sta = edge_nodes.last().unwrap();
 
-        println!("\nAIが指定した始発駅: {}", from_sta.station_name);
-        println!("AIが指定した終着駅: {}", destination_sta.station_name);
-        println!("探索を開始しました...\n");
+        println!("\n始発駅: {}", from_sta.station_name);
+        println!("終着駅: {}", destination_sta.station_name);
 
         let start_id = from_sta.station_cd;
         let goal_id = destination_sta.station_cd;
@@ -395,18 +353,18 @@ async fn main() {
         .read_line(&mut destination_place_name)
         .expect("I/Oエラーです");
 
-    let coordinates_pairs =
-        predict(from_place_name, destination_place_name).expect("推論中にエラーが発生しました");
-
     let pool = MySqlPoolOptions::new()
         .max_connections(5)
         .connect(env!("DATABASE_URL"))
         .await
         .expect("MySQLに接続できませんでした");
 
-    let finder = RouteFinder::new(pool, coordinates_pairs).await;
+    let finder = RouteFinder::new(pool).await;
 
-    let stations = finder.find_routes().await.expect("経路検索に失敗しました");
+    let stations = finder
+        .find_routes(from_place_name.clone(), destination_place_name.clone())
+        .await
+        .expect("経路検索に失敗しました");
 
     let mut texts = String::new();
 
@@ -424,4 +382,13 @@ async fn main() {
     }
 
     println!("{}", texts);
+
+    println!("\nAIのおすすめ情報:");
+    predict(
+        from_place_name,
+        destination_place_name,
+        stations.iter().map(|x| x.station_name.clone()).collect(),
+    )
+    .await
+    .unwrap();
 }
