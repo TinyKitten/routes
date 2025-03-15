@@ -154,13 +154,21 @@ async fn predict(
 ) -> Result<(), reqwest::Error> {
     let client = reqwest::Client::new();
     let mut res= client
-        .post("http://localhost:1234/v1/chat/completions")
+        .post("http://localhost:11434/v1/chat/completions")
         .header("Content-Type", "application/json")
         .body(json!({
-            "model": "gemma-2-9b-it",
+            "model": "gemma3",
             "messages": [{
+                "role": "system",
+                "content": "あなたは優秀なトラベルコーディネーターです。お客様であるユーザーからの質問に対して、旅行に関する情報を提供してください。"
+            },
+            {
                 "role": "user",
-                "content": format!("{}から{}まで鉄道で移動するのでおすすめの観光地を教えてください。ただし、下記の駅の付近限定でお願いします。\n{:?}", from_place_name,destination_place_name, stop_stations)
+                "content": format!(
+                    "{}から{}まで鉄道で移動するのでおすすめの観光地を教えてください。ただし、下記の駅の付近限定でお願いします。\n{:?}",
+                    from_place_name,
+                    destination_place_name,
+                    stop_stations)
             }],
             "stream": true
         }).to_string())
@@ -223,7 +231,7 @@ impl RouteFinder {
         .fetch_optional(&mut *conn)
         .await
         .expect("データベースでエラーが発生しました")
-        .expect(&format!("や、{}駅のNASA🚀", station_name));
+        .unwrap_or_else(|| panic!("や、{}駅のNASA🚀", station_name));
 
         Ok(station_row)
     }
